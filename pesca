@@ -1,0 +1,287 @@
+local CoreGui = game:GetService("CoreGui")
+local Players = game:GetService("Players")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local events = require(ReplicatedStorage.Shared.Modules.events)
+local fishFightInfo = require(ReplicatedStorage.Shared.Modules.Information.fishFightInfo)
+local RemoteEvent = ReplicatedStorage.Shared.Modules.events.RemoteEvent
+
+local genv = (getgenv and getgenv()) or _G
+
+-- Tempo em segundos para o Auto Sell vender os peixes (60 = 1 minuto)
+local TEMPO_DE_VENDA = 60 
+
+-- Limpa a instância anterior se houver
+if genv.UnifiedFishHub then
+    genv.UnifiedFishHub.Stop()
+end
+
+local instance = { 
+    stopped = false, 
+    autoFishEnabled = false, -- Lança a isca e ganha o minigame
+    antiAfkEnabled = false,  -- Evita desconexão
+    autoSellEnabled = false, -- Vende peixes por tempo
+    isFighting = false,      -- Trava para não lançar isca durante a luta
+    connections = {}
+}
+local originals = {}
+
+-- ================================
+-- CAPTURA DOS HANDLERS DO MINIGAME
+-- ================================
+local function getHandlers()
+    local upvalues = getupvalues and getupvalues(events.Bind) or {}
+    if not getupvalues then
+        for i = 1, 10 do
+            local ok, value = pcall(debug.getupvalue, events.Bind, i)
+            if not ok then break end
+            upvalues[i] = value
+        end
+    end
+    for _, value in upvalues do
+        if type(value) == "table" and type(value.FishFightStart) == "table" then
+            return value
+        end
+    end
+    return nil
+end
+
+local handlers = getHandlers()
+if handlers then
+    for guid, fn in pairs(handlers.FishFightStart) do
+        local source = debug.info(fn, "s")
+        if source == "FishFight" or source:find("%.FishFight$") then
+            originals[guid] = fn
+            handlers.FishFightStart[guid] = nil
+        end
+    end
+end
+
+-- ================================
+-- CRIANDO A INTERFACE (GUI)
+-- ================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "UnifiedFishHub"
+ScreenGui.Parent = pcall(function() return CoreGui.Name end) and CoreGui or LocalPlayer:WaitForChild("PlayerGui")
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 250, 0, 240)
+MainFrame.Position = UDim2.new(0.5, -125, 0.5, -120)
+MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0, 8)
+UICorner.Parent = MainFrame
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 40)
+Title.BackgroundTransparency = 1
+Title.Text = "🎣 Hub Unificado"
+Title.TextColor3 = Color3.fromRGB(29, 221, 109)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 18
+Title.Parent = MainFrame
+
+local ButtonContainer = Instance.new("Frame")
+ButtonContainer.Size = UDim2.new(1, -20, 1, -50)
+ButtonContainer.Position = UDim2.new(0, 10, 0, 40)
+ButtonContainer.BackgroundTransparency = 1
+ButtonContainer.Parent = MainFrame
+
+local UIListLayout = Instance.new("UIListLayout")
+UIListLayout.Padding = UDim.new(0, 10)
+UIListLayout.Parent = ButtonContainer
+
+-- Função para criar botões padronizados
+local function createButton(name, text)
+    local btn = Instance.new("TextButton")
+    btn.Name = name
+    btn.Size = UDim2.new(1, 0, 0, 35)
+    btn.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
+    btn.Text = text .. ": OFF"
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 14
+    btn.Parent = ButtonContainer
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+
+    return btn
+end
+
+local ToggleFishBtn = createButton("ToggleFishBtn", "Auto Pescar")
+local ToggleAfkBtn = createButton("ToggleAfkBtn", "Anti-AFK")
+local ToggleSellBtn = createButton("ToggleSellBtn", "Auto Sell ("..TEMPO_DE_VENDA.."s)")
+
+local CloseButton = Instance.new("TextButton")
+CloseButton.Size = UDim2.new(1, 0, 0, 30)
+CloseButton.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+CloseButton.Text = "Fechar Painel"
+CloseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseButton.Font = Enum.Font.GothamBold
+CloseButton.TextSize = 13
+CloseButton.Parent = ButtonContainer
+Instance.new("UICorner", CloseButton).CornerRadius = UDim.new(0, 6)
+
+-- ================================
+-- LÓGICA DAS FUNÇÕES
+-- ================================
+
+-- 1. Lógica Anti-AFK
+local afkConnection = nil
+local function antiAfkPulse()
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Unknown, false, game)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Unknown, false, game)
+    end)
+    pcall(function()
+        local position = UserInputService:GetMouseLocation()
+        VirtualInputManager:SendMouseMoveEvent(position.X, position.Y, game)
+    end)
+    local env = (getgenv and getgenv()) or _G
+    local fire = env.firesignal or env.fireSignal
+    if type(fire) == "function" then
+        pcall(fire, UserInputService.WindowFocused)
+    end
+end
+
+ToggleAfkBtn.MouseButton1Click:Connect(function()
+    instance.antiAfkEnabled = not instance.antiAfkEnabled
+    ToggleAfkBtn.BackgroundColor3 = instance.antiAfkEnabled and Color3.fromRGB(60, 200, 60) or Color3.fromRGB(220, 60, 60)
+    ToggleAfkBtn.Text = "Anti-AFK: " .. (instance.antiAfkEnabled and "ON" or "OFF")
+
+    if instance.antiAfkEnabled then
+        afkConnection = LocalPlayer.Idled:Connect(antiAfkPulse)
+    else
+        if afkConnection then afkConnection:Disconnect() afkConnection = nil end
+    end
+end)
+
+-- 2. Lógica Auto Pescar (Cast + Catch)
+ToggleFishBtn.MouseButton1Click:Connect(function()
+    instance.autoFishEnabled = not instance.autoFishEnabled
+    ToggleFishBtn.BackgroundColor3 = instance.autoFishEnabled and Color3.fromRGB(60, 200, 60) or Color3.fromRGB(220, 60, 60)
+    ToggleFishBtn.Text = "Auto Pescar: " .. (instance.autoFishEnabled and "ON" or "OFF")
+end)
+
+if handlers then
+    events:Bind("FishFightStart", function(playerName, data)
+        if instance.stopped or playerName ~= LocalPlayer.Name or type(data) ~= "table" then return end
+
+        if not instance.autoFishEnabled then
+            for _, fn in pairs(originals) do
+                task.spawn(fn, playerName, data)
+            end
+            return
+        end
+
+        instance.isFighting = true 
+        local fish = data.fish
+        local skills = data.skills or {}
+        local pattern = (type(fish) == "table" and fish.pattern) or data.pattern
+
+        local minTime = 0
+        local success, result = pcall(fishFightInfo.MinWinSeconds, fish, skills, pattern)
+        if success and type(result) == "number" then
+            minTime = result
+        else
+            minTime = 5
+        end
+
+        local fightDelay = minTime + 0.5 + (math.random() * 1.0)
+
+        task.delay(fightDelay, function()
+            if instance.stopped or not instance.autoFishEnabled then
+                instance.isFighting = false
+                return
+            end
+            events:Fire("fishFightResult", data.id, "win", 100)
+            task.wait(1)
+            instance.isFighting = false
+        end)
+    end)
+end
+
+local lastCast = 0
+table.insert(instance.connections, RunService.RenderStepped:Connect(function()
+    if not instance.autoFishEnabled or instance.stopped or instance.isFighting then return end
+
+    local fightUI = LocalPlayer.PlayerGui:FindFirstChild("FishFightUI")
+    if fightUI and fightUI.Enabled then return end
+    if os.clock() - lastCast < 2.5 then return end
+
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local rayOrigin = root.CFrame * Vector3.new(0, 0, -20)
+    local rayDirection = Vector3.new(0, -30, 0)
+    local result = workspace:Raycast(rayOrigin, rayDirection, RaycastParams.new())
+    
+    if not result or result.Material ~= Enum.Material.Water then return end
+
+    lastCast = os.clock()
+    events:Fire("Fish", {
+        fishingAction = "createBuoy",
+        validateFishing = LocalPlayer.UserId * game.PlaceVersion * 3,
+        destiny = result.Position
+    })
+end))
+
+-- 3. Lógica Auto Sell (Por Tempo)
+local sellConnection = nil
+ToggleSellBtn.MouseButton1Click:Connect(function()
+    instance.autoSellEnabled = not instance.autoSellEnabled
+    ToggleSellBtn.BackgroundColor3 = instance.autoSellEnabled and Color3.fromRGB(60, 200, 60) or Color3.fromRGB(220, 60, 60)
+    ToggleSellBtn.Text = "Auto Sell ("..TEMPO_DE_VENDA.."s): " .. (instance.autoSellEnabled and "ON" or "OFF")
+
+    if instance.autoSellEnabled then
+        sellConnection = task.spawn(function()
+            while instance.autoSellEnabled do
+                task.wait(TEMPO_DE_VENDA)
+                pcall(function()
+                    RemoteEvent:FireServer("sellFish")
+                end)
+            end
+        end)
+    else
+        if sellConnection then
+            task.cancel(sellConnection)
+            sellConnection = nil
+        end
+    end
+end)
+
+-- Função de Parada/Limpeza
+function instance.Stop()
+    if instance.stopped then return end
+    instance.stopped = true
+    
+    if handlers then
+        for guid, fn in pairs(originals) do
+            handlers.FishFightStart[guid] = fn
+        end
+    end
+    
+    for _, conn in pairs(instance.connections) do
+        conn:Disconnect()
+    end
+    if afkConnection then afkConnection:Disconnect() end
+    if sellConnection then task.cancel(sellConnection) end
+    
+    if ScreenGui then ScreenGui:Destroy() end
+    if genv.UnifiedFishHub == instance then genv.UnifiedFishHub = nil end
+end
+
+CloseButton.MouseButton1Click:Connect(instance.Stop)
+genv.UnifiedFishHub = instance
